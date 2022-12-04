@@ -5,7 +5,8 @@ Defines autosub's main functionality.
 #!/usr/bin/env python
 
 
-
+import numpy as np
+from scipy.fft import fft
 import argparse
 import audioop
 import math
@@ -17,6 +18,7 @@ import tempfile
 import wave
 import json
 import requests
+from pathlib import Path
 try:
     from json.decoder import JSONDecodeError
 except ImportError:
@@ -56,7 +58,9 @@ class FLACConverter(object): # pylint: disable=too-few-public-methods
     Class for converting a region of an input audio or video file into a FLAC audio file
     """
     def __init__(self, source_path, include_before=0.25, include_after=0.25):
-        self.source_path = source_path
+        self.source_path = Path(source_path)
+        self.flac_path = self.source_path.parent.joinpath(self.source_path.stem + '_chunks')
+        self.flac_path.mkdir(exist_ok=True)
         self.include_before = include_before
         self.include_after = include_after
 
@@ -65,14 +69,15 @@ class FLACConverter(object): # pylint: disable=too-few-public-methods
             start, end = region
             start = max(0, start - self.include_before)
             end += self.include_after
-            temp = tempfile.NamedTemporaryFile(suffix='.flac', delete=False)
+            temp_path = self.flac_path.joinpath(f'tmp_{int(start*1000):08}_{int(end*1000):08}.flac')
+            print(temp_path.name)
             command = ["ffmpeg", "-ss", str(start), "-t", str(end - start),
                        "-y", "-i", self.source_path,
-                       "-loglevel", "error", temp.name]
+                       "-loglevel", "error", str(temp_path)]
             use_shell = True if os.name == "nt" else False
             subprocess.check_output(command, stdin=open(os.devnull), shell=use_shell)
-            read_data = temp.read()
-            temp.close()
+            with open(temp_path, 'rb') as temp:
+                read_data = temp.read()
             os.unlink(temp.name)
             return read_data
 
@@ -172,11 +177,11 @@ def which(program):
     return None
 
 
-def extract_audio(filename, channels=1, rate=16000):
+def extract_audio(filename, channels=1, rate=44100):
     """
     Extract audio from an input file to a temporary WAV file.
     """
-    temp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    temp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False, dir=r'F:\JDownloader\Downloads\060\autosub')
     if not os.path.isfile(filename):
         print("The given file does not exist: {}".format(filename))
         raise Exception("Invalid filepath: {}".format(filename))
@@ -191,7 +196,45 @@ def extract_audio(filename, channels=1, rate=16000):
     return temp.name, rate
 
 
-def find_speech_regions(filename, frame_width=4096, min_region_size=0.5, max_region_size=6): # pylint: disable=too-many-locals
+# def find_speech_regions(filename, frame_width=4096, min_region_size=0.5, max_region_size=6): # pylint: disable=too-many-locals
+#     """
+#     Perform voice activity detection on a given audio file.
+#     """
+#     reader = wave.open(filename)
+#     sample_width = reader.getsampwidth()
+#     rate = reader.getframerate()
+#     n_channels = reader.getnchannels()
+#     chunk_duration = float(frame_width) / rate
+#
+#     n_chunks = int(math.ceil(reader.getnframes()*1.0 / frame_width))
+#     energies = []
+#
+#     for _ in range(n_chunks):
+#         chunk = reader.readframes(frame_width)
+#         energies.append(audioop.rms(chunk, sample_width * n_channels))
+#
+#     threshold = percentile(energies, 0.2)
+#
+#     elapsed_time = 0
+#
+#     regions = []
+#     region_start = None
+#
+#     for energy in energies:
+#         is_silence = energy <= threshold
+#         max_exceeded = region_start and elapsed_time - region_start >= max_region_size
+#
+#         if (max_exceeded or is_silence) and region_start:
+#             if elapsed_time - region_start >= min_region_size:
+#                 regions.append((region_start, elapsed_time))
+#                 region_start = None
+#
+#         elif (not region_start) and (not is_silence):
+#             region_start = elapsed_time
+#         elapsed_time += chunk_duration
+#     return regions
+def find_speech_regions(filename, chunk_duration=0.1, min_region_size=0.5, max_region_size=6,
+                        speach_freq_range=(20, 600)):  # pylint: disable=too-many-locals
     """
     Perform voice activity detection on a given audio file.
     """
@@ -199,14 +242,19 @@ def find_speech_regions(filename, frame_width=4096, min_region_size=0.5, max_reg
     sample_width = reader.getsampwidth()
     rate = reader.getframerate()
     n_channels = reader.getnchannels()
-    chunk_duration = float(frame_width) / rate
+    frame_width = int(rate * chunk_duration)
 
-    n_chunks = int(math.ceil(reader.getnframes()*1.0 / frame_width))
-    energies = []
-
-    for _ in range(n_chunks):
-        chunk = reader.readframes(frame_width)
-        energies.append(audioop.rms(chunk, sample_width * n_channels))
+    n_chunks = int(math.ceil(reader.getnframes() * 1.0 / frame_width))
+    audio_data_chunks = [
+        np.frombuffer(
+            reader.readframes(frame_width), getattr(np, f'int{8*sample_width}')
+        ).reshape(-1, n_channels).T for _ in range(n_chunks)
+    ]
+    audio_data_chunks_fft = [fft(adc) for adc in audio_data_chunks]
+    freq_idx_lb = max(1, int(np.floor(speach_freq_range[0] * chunk_duration)))
+    freq_idx_ub = min(frame_width // 2, int(np.ceil(speach_freq_range[1] * chunk_duration)))
+    energies = [np.abs((adcf[:, freq_idx_lb:freq_idx_ub] * adcf[:, -freq_idx_lb:-freq_idx_ub:-1]).sum()) for adcf in
+                audio_data_chunks_fft]
 
     threshold = percentile(energies, 0.2)
 
@@ -243,6 +291,7 @@ def generate_subtitles( # pylint: disable=too-many-locals,too-many-arguments
     Given an input audio/video file, generate subtitles in the specified language and format.
     """
     audio_filename, audio_rate = extract_audio(source_path)
+    audio_filename = source_path
 
     regions = find_speech_regions(audio_filename)
 
