@@ -61,12 +61,13 @@ class FLACConverter(object):  # pylint: disable=too-few-public-methods
     Class for converting a region of an input audio or video file into a FLAC audio file
     """
 
-    def __init__(self, source_path, include_before=0.25, include_after=0.25):
+    def __init__(self, source_path, include_before=0.25, include_after=0.25, verbose=False):
         self.source_path = Path(source_path)
         self.flac_path = self.source_path.parent.joinpath(self.source_path.stem + "_chunks")
         self.flac_path.mkdir(exist_ok=True)
         self.include_before = include_before
         self.include_after = include_after
+        self.verbose = verbose
 
     def __call__(self, region):
         try:
@@ -74,7 +75,6 @@ class FLACConverter(object):  # pylint: disable=too-few-public-methods
             temp_path = self.flac_path.joinpath(f"tmp_{int(start * 1000):08}_{int(end * 1000):08}.flac")
             start = max(0, start - self.include_before)
             end += self.include_after
-            print(temp_path.name)
             command = [
                 "ffmpeg",
                 "-ss",
@@ -92,7 +92,8 @@ class FLACConverter(object):  # pylint: disable=too-few-public-methods
             subprocess.check_output(command, stdin=open(os.devnull), shell=use_shell)
             with open(temp_path, "rb") as temp:
                 read_data = temp.read()
-            os.unlink(temp.name)
+            if not self.verbose:
+                os.unlink(temp.name)
             return read_data
 
         except KeyboardInterrupt:
@@ -255,7 +256,8 @@ def find_speech_regions(
     speach_freq_range=(20, 3000),
     non_speech_freq_threshold=2000,
     db_filter=0.0001,
-    non_speech_filters=[(0.2, 2), (0.06, np.inf)],
+    non_speech_filters=[(0.2, 2), (0.1, np.inf)],
+    verbose=False,
 ):  # pylint: disable=too-many-locals
     """
     Perform voice activity detection on a given audio file.
@@ -276,7 +278,6 @@ def find_speech_regions(
     freq_idx_lb = max(1, int(np.floor(speach_freq_range[0] * chunk_duration)))
     freq_idx_ub = min(max_freq_idx, int(np.ceil(speach_freq_range[1] * chunk_duration)))
 
-    non_speech_freq_idx = min(max_freq_idx, int(np.ceil(non_speech_freq_threshold * chunk_duration)))
     energies = [
         np.abs((adcf[:, freq_idx_lb:freq_idx_ub] * adcf[:, -freq_idx_lb:-freq_idx_ub:-1]).sum())
         for adcf in audio_data_chunks_fft
@@ -289,10 +290,12 @@ def find_speech_regions(
     elapsed_time = 0
 
     regions = []
+    filtered_regions = []
     region_start = None
     start_idx = 0
 
     if non_speech_freq_threshold > 0 and len(non_speech_filters) > 1:
+        non_speech_freq_idx = min(max_freq_idx, int(np.ceil(non_speech_freq_threshold * chunk_duration)))
         non_speech_energies = [
             np.abs((adcf[:, non_speech_freq_idx:max_freq_idx] * adcf[:, -non_speech_freq_idx:-max_freq_idx:-1]).sum())
             for adcf in audio_data_chunks_fft
@@ -303,16 +306,17 @@ def find_speech_regions(
     def filter_ranges(range_start_idx, range_end_idx, duration):
         avg_speech_energy = sum(energies[range_start_idx:range_end_idx]) / (range_end_idx - range_start_idx)
         if avg_speech_energy < energy_threshold:
-            return False
+            return False, f"avg_energy ({avg_speech_energy}) < threshold ({energy_threshold})"
         if non_speech_energies is not None:
             avg_non_speech_energy = sum(non_speech_energies[range_start_idx:range_end_idx]) / (
                 range_end_idx - range_start_idx
             )
+            ratio = avg_non_speech_energy / avg_speech_energy
             for ratio_threshold, duration_threshold in non_speech_filters:
-                if avg_non_speech_energy / avg_speech_energy < ratio_threshold and duration < duration_threshold:
-                    return True
-            return False
-        return True
+                if ratio < ratio_threshold and duration < duration_threshold:
+                    return True, ""
+            return False, f"filtered, duration={duration}, non_speech_energy={avg_non_speech_energy}, speech_energy={avg_speech_energy }, ratio={ratio}"
+        return True, ""
 
     for idx, energy in enumerate(energies):
         is_silence = energy <= threshold
@@ -320,14 +324,22 @@ def find_speech_regions(
 
         if (max_exceeded or is_silence) and region_start:
             if elapsed_time - region_start >= min_region_size:
-                if filter_ranges(start_idx, idx, elapsed_time - region_start):
+                keep, reason = filter_ranges(start_idx, idx, elapsed_time - region_start)
+                if keep:
                     regions.append((region_start, elapsed_time))
+                elif verbose:
+                    filtered_regions.append((region_start, elapsed_time, reason))
                 region_start = None
                 start_idx = idx
 
         elif (not region_start) and (not is_silence):
             region_start = elapsed_time
         elapsed_time += chunk_duration
+
+    if verbose:
+        with open("filtered_region.txt", "w") as f:
+            f.write("\n".join(f"{s:.3f} {e:.3f} {r}" for s, e, r in filtered_regions))
+
     return regions
 
 
@@ -339,28 +351,34 @@ def generate_subtitles(  # pylint: disable=too-many-locals,too-many-arguments
     dst_language=DEFAULT_DST_LANGUAGE,
     subtitle_file_format=DEFAULT_SUBTITLE_FORMAT,
     api_key=None,
+    verbose=False,
+    skip_recognize=False,
 ):
     """
     Given an input audio/video file, generate subtitles in the specified language and format.
     """
-    audio_filename, audio_rate = extract_audio(source_path)
-
-    regions = find_speech_regions(audio_filename)
+    print("Extract audios ...")
+    audio_filename, audio_rate = extract_audio(source_path, rate=22050)
+    print("Searching regions which possibly contains vocal ...")
+    regions = find_speech_regions(audio_filename, verbose=verbose)
 
     pool = multiprocessing.Pool(concurrency)
-    converter = FLACConverter(source_path=audio_filename)
+    converter = FLACConverter(source_path=audio_filename, verbose=verbose)
     recognizer = SpeechRecognizer(language=src_language, rate=audio_rate, api_key=GOOGLE_SPEECH_API_KEY)
 
     transcripts = []
     if regions:
         try:
             extracted_regions = []
-            with tqdm(total=len(regions)) as pbar:
+            with tqdm(total=len(regions), desc="Converting speech regions to FLAC files") as pbar:
                 for i, extracted_region in enumerate(pool.imap(converter, regions)):
                     extracted_regions.append(extracted_region)
                     pbar.update(1)
 
-            with tqdm(total=len(extracted_regions)) as pbar:
+            if skip_recognize:
+                return ""
+
+            with tqdm(total=len(extracted_regions), desc="Performing speech recognition") as pbar:
                 for i, transcript in enumerate(pool.imap(recognizer, extracted_regions)):
                     transcripts.append(transcript)
                     pbar.update(1)
@@ -402,7 +420,8 @@ def generate_subtitles(  # pylint: disable=too-many-locals,too-many-arguments
     with open(dest, "wb") as output_file:
         output_file.write(formatted_subtitles.encode("utf-8"))
 
-    os.remove(audio_filename)
+    if not verbose:
+        os.remove(audio_filename)
 
     return dest
 
@@ -456,6 +475,8 @@ def main():
     )
     parser.add_argument("--list-formats", help="List all available subtitle formats", action="store_true")
     parser.add_argument("--list-languages", help="List all available source/destination languages", action="store_true")
+    parser.add_argument("-v", "--verbose", type=bool, help="if keep intermediate results", default=False)
+    parser.add_argument("-skr", "--skip-recognize", type=bool, help="if prepare data only", default=False)
 
     args = parser.parse_args()
 
@@ -483,6 +504,7 @@ def main():
             api_key=args.api_key,
             subtitle_file_format=args.format,
             output=args.output,
+            verbose=args.verbose,
         )
         print("Subtitles file created at {}".format(subtitle_file_path))
     except KeyboardInterrupt:
