@@ -198,7 +198,10 @@ def extract_audio(filename, channels=1, rate=44100):
     Extract audio from an input file to a temporary WAV file.
     """
     temp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    os.unlink(temp.name)
+    try:
+        os.unlink(temp.name)
+    except:
+        pass
     if not os.path.isfile(filename):
         print("The given file does not exist: {}".format(filename))
         raise Exception("Invalid filepath: {}".format(filename))
@@ -256,7 +259,7 @@ def find_speech_regions(
     speach_freq_range=(20, 3000),
     non_speech_freq_threshold=2000,
     db_filter=0.0001,
-    non_speech_filters=[(0.2, 2), (0.1, np.inf)],
+    non_speech_filters=None,
     verbose=False,
 ):  # pylint: disable=too-many-locals
     """
@@ -273,15 +276,16 @@ def find_speech_regions(
         np.frombuffer(reader.readframes(frame_width), getattr(np, f"int{8 * sample_width}")).reshape(-1, n_channels).T
         for _ in range(n_chunks)
     ]
+    if len(audio_data_chunks[-1]) < frame_width:
+        audio_data_chunks.pop(-1)
     audio_data_chunks_fft = [fft(adc) for adc in audio_data_chunks]
     max_freq_idx = frame_width // 2
     freq_idx_lb = max(1, int(np.floor(speach_freq_range[0] * chunk_duration)))
     freq_idx_ub = min(max_freq_idx, int(np.ceil(speach_freq_range[1] * chunk_duration)))
 
-    energies = [
-        np.abs((adcf[:, freq_idx_lb:freq_idx_ub] * adcf[:, -freq_idx_lb:-freq_idx_ub:-1]).sum())
-        for adcf in audio_data_chunks_fft
-    ]
+    range_energies_spectrums = [np.abs(acdf[:, 1:max_freq_idx] * acdf[:, -1:-max_freq_idx:-1]) for acdf in audio_data_chunks_fft]
+
+    energies = [respectrum[:, freq_idx_lb-1:freq_idx_ub-1].sum() for respectrum in range_energies_spectrums]
 
     threshold = percentile(energies, 0.2)
     max_energy = max(energies)
@@ -291,15 +295,13 @@ def find_speech_regions(
 
     regions = []
     filtered_regions = []
+    spectrums = {}
     region_start = None
     start_idx = 0
 
-    if non_speech_freq_threshold > 0 and len(non_speech_filters) > 1:
+    if non_speech_freq_threshold > 0 and non_speech_filters is not None and len(non_speech_filters) > 1:
         non_speech_freq_idx = min(max_freq_idx, int(np.ceil(non_speech_freq_threshold * chunk_duration)))
-        non_speech_energies = [
-            np.abs((adcf[:, non_speech_freq_idx:max_freq_idx] * adcf[:, -non_speech_freq_idx:-max_freq_idx:-1]).sum())
-            for adcf in audio_data_chunks_fft
-        ]
+        non_speech_energies = [respectrum[:, non_speech_freq_idx-1:].sum() for respectrum in range_energies_spectrums]
     else:
         non_speech_energies = None
 
@@ -329,6 +331,9 @@ def find_speech_regions(
                     regions.append((region_start, elapsed_time))
                 elif verbose:
                     filtered_regions.append((region_start, elapsed_time, reason))
+                if verbose:
+                    spectrums[(region_start, elapsed_time)] = sum(range_energies_spectrums[start_idx:idx])[0] / (idx-start_idx)
+
                 region_start = None
                 start_idx = idx
 
@@ -339,6 +344,9 @@ def find_speech_regions(
     if verbose:
         with open("filtered_region.txt", "w") as f:
             f.write("\n".join(f"{s:.3f} {e:.3f} {r}" for s, e, r in filtered_regions))
+        lines = [f"{rs:.3f},{re:.3f}," + ",".join(f"{sgrid:.4f}" for sgrid in spectrum) + '\n' for (rs, re), spectrum in spectrums.items()]
+        with open("spectrums.csv", "w") as f:
+            f.writelines(lines)
 
     return regions
 
